@@ -1,6 +1,7 @@
 import json
 import random
 import re
+import subprocess
 import sys
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -1229,15 +1230,19 @@ class TestPyFSRS:
             _ = scheduler.reschedule_card(card=card, review_logs=review_logs)
 
     def test_Optimizer_lazy_loading(self):
-        assert "fsrs.scheduler" in sys.modules
-        assert "fsrs.card" in sys.modules
-        assert "fsrs.review_log" in sys.modules
-
-        assert "fsrs.optimizer" not in sys.modules
-
-        from fsrs import Optimizer  # noqa: F401 (linter: unused import)
-
-        assert "fsrs.optimizer" in sys.modules
+        # test_optimizer.py imports fsrs.optimizer at collection time, so the
+        # lazy-loading guarantee can only be checked in a fresh interpreter
+        script = (
+            "import sys;"
+            "import fsrs;"
+            "assert 'fsrs.scheduler' in sys.modules;"
+            "assert 'fsrs.card' in sys.modules;"
+            "assert 'fsrs.review_log' in sys.modules;"
+            "assert 'fsrs.optimizer' not in sys.modules;"
+            "from fsrs import Optimizer;"
+            "assert 'fsrs.optimizer' in sys.modules"
+        )
+        subprocess.run([sys.executable, "-c", script], check=True)
 
     def test_import_non_existent_module(self):
         with pytest.raises(ImportError):

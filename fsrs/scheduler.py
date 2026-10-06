@@ -6,6 +6,9 @@ This module defines the Scheduler class as well as the various constants used in
 
 Classes:
     Scheduler: The FSRS spaced-repetition scheduler.
+    Trace: Collects TraceRecord entries describing each step of a review/preview.
+    TraceRecord: One observed step in the Rating -> Card/ReviewLog pipeline.
+    NextStates: The four possible next Cards (Again/Hard/Good/Easy) of a review.
 """
 
 from __future__ import annotations
@@ -125,6 +128,109 @@ FUZZ_RANGES = [
 ]
 
 
+@dataclass(frozen=True)
+class TraceRecord:
+    """
+    One observed step in the Rating -> Card/ReviewLog pipeline.
+
+    Attributes:
+        context: Which entry point produced the record, e.g. "review_card" or "next_states:Good".
+        source: The name of the function that produced the value, e.g. "_next_stability".
+        field: The Card field or intermediate quantity the record describes.
+        before: The value before the step (None if not applicable).
+        after: The value after the step.
+        note: Extra detail, e.g. which clamp bound or learning-step branch applied.
+    """
+
+    context: str
+    source: str
+    field: str
+    before: object
+    after: object
+    note: str
+
+
+class Trace:
+    """
+    Observability sink for Scheduler.review_card() and Scheduler.next_states().
+
+    Pass an instance via the `trace` argument and every step of the computation
+    (state machine branch, memory-state update, clamp boundary, interval choice,
+    Card write-back, ReviewLog creation) is appended as a TraceRecord.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[TraceRecord] = []
+        self.context: str = ""
+
+    def record(
+        self,
+        *,
+        source: str,
+        field: str,
+        before: object,
+        after: object,
+        note: str = "",
+    ) -> None:
+        self.records.append(
+            TraceRecord(
+                context=self.context,
+                source=source,
+                field=field,
+                before=before,
+                after=after,
+                note=note,
+            )
+        )
+
+
+def _record(
+    trace: Trace | None,
+    *,
+    source: str,
+    field: str,
+    before: object,
+    after: object,
+    note: str = "",
+) -> None:
+    """
+    Appends a TraceRecord when a Trace is attached; a no-op otherwise.
+    """
+
+    if trace is not None:
+        trace.record(source=source, field=field, before=before, after=after, note=note)
+
+
+@dataclass(frozen=True)
+class NextStates:
+    """
+    The four possible next Cards of a review, one per Rating.
+
+    Attributes:
+        again: The Card as it would look after an Again rating.
+        hard: The Card as it would look after a Hard rating.
+        good: The Card as it would look after a Good rating.
+        easy: The Card as it would look after an Easy rating.
+    """
+
+    again: Card
+    hard: Card
+    good: Card
+    easy: Card
+
+    def items(self) -> tuple[tuple[Rating, Card], ...]:
+        """
+        Returns the (Rating, next Card) pairs in Again/Hard/Good/Easy order.
+        """
+
+        return (
+            (Rating.Again, self.again),
+            (Rating.Hard, self.hard),
+            (Rating.Good, self.good),
+            (Rating.Easy, self.easy),
+        )
+
+
 class SchedulerDict(TypedDict):
     """
     JSON-serializable dictionary representation of a Scheduler object.
@@ -239,35 +345,143 @@ class Scheduler:
         rating: Rating,
         review_datetime: datetime | None = None,
         review_duration: int | None = None,
+        trace: Trace | None = None,
     ) -> tuple[Card, ReviewLog]:
         """
         Reviews a card with a given rating at a given time for a specified duration.
 
         Args:
-            card: The card being reviewed.
+            card: The card being reviewed. It is never mutated in place.
             rating: The chosen rating for the card being reviewed.
             review_datetime: The date and time of the review.
             review_duration: The number of miliseconds it took to review the card or None if unspecified.
+            trace: An optional Trace that collects a TraceRecord for every step of the review.
 
         Returns:
             tuple[Card,ReviewLog]: A tuple containing the updated, reviewed card and its corresponding review log.
 
         Raises:
             ValueError: If the `review_datetime` argument is not timezone-aware and set to UTC.
+
+        Design note (API surface): the returned ReviewLog intentionally exposes only the
+        four public fields (card_id, rating, review_datetime, review_duration) that the
+        Optimizer consumes. Every intermediate value of the scheduling computation is
+        observable through the opt-in `trace` argument instead, so the scheduling API is
+        not inflated with internal structure.
         """
 
-        if review_datetime is not None and (
-            (review_datetime.tzinfo is None) or (review_datetime.tzinfo != timezone.utc)
-        ):
-            raise ValueError("datetime must be timezone-aware and set to UTC")
-
-        card = copy(card)
+        self._validate_review_datetime(review_datetime=review_datetime)
 
         if review_datetime is None:
             review_datetime = datetime.now(timezone.utc)
 
+        previous_context = trace.context if trace is not None else ""
+        if trace is not None:
+            trace.context = "review_card"
+        try:
+            # the caller's Card is never mutated in place: update_state() writes to a private copy
+            _record(
+                trace,
+                source="review_card",
+                field="card",
+                before=card.to_dict(),
+                after="copied",
+                note="input Card is left untouched; update_state() mutates a private copy",
+            )
+            card = copy(card)
+
+            next_interval = self.update_state(
+                card=card,
+                rating=rating,
+                review_datetime=review_datetime,
+                trace=trace,
+            )
+
+            if self.enable_fuzzing and card.state == State.Review:
+                unfuzzed_interval = next_interval
+                next_interval = self._get_fuzzed_interval(interval=next_interval)
+                _record(
+                    trace,
+                    source="_get_fuzzed_interval",
+                    field="next_interval",
+                    before=unfuzzed_interval,
+                    after=next_interval,
+                    note="random fuzz applied to Review-state intervals",
+                )
+
+            card.due = review_datetime + next_interval
+            card.last_review = review_datetime
+            _record(
+                trace,
+                source="review_card",
+                field="due",
+                before=None,
+                after=card.due,
+                note="due = review_datetime + next_interval",
+            )
+            _record(
+                trace,
+                source="review_card",
+                field="last_review",
+                before=None,
+                after=card.last_review,
+                note="write-back to the returned Card copy",
+            )
+
+            review_log = ReviewLog(
+                card_id=card.card_id,
+                rating=rating,
+                review_datetime=review_datetime,
+                review_duration=review_duration,
+            )
+            _record(
+                trace,
+                source="review_card",
+                field="review_log",
+                before=None,
+                after=review_log.to_dict(),
+                note="only the four public ReviewLog fields consumed by the Optimizer leave the scheduler",
+            )
+        finally:
+            if trace is not None:
+                trace.context = previous_context
+
+        return card, review_log
+
+    def update_state(
+        self,
+        *,
+        card: Card,
+        rating: Rating,
+        review_datetime: datetime,
+        trace: Trace | None = None,
+    ) -> timedelta:
+        """
+        Advances a card one review forward and returns its next interval.
+
+        This is the low-level state machine shared by review_card() and next_states().
+
+        Args:
+            card: The card to update. Mutated in place; pass a copy if the original must be preserved
+                (review_card() and next_states() already copy for you).
+            rating: The chosen rating for the card.
+            review_datetime: The date and time of the review (timezone-aware, UTC).
+            trace: An optional Trace that collects a TraceRecord for every step.
+
+        Returns:
+            timedelta: The interval until the card's next review.
+        """
+
         days_since_last_review = (
             (review_datetime - card.last_review).days if card.last_review else None
+        )
+        _record(
+            trace,
+            source="update_state",
+            field="days_since_last_review",
+            before=card.last_review,
+            after=days_since_last_review,
+            note="timedelta.days floors to whole days; values < 1 select _short_term_stability, otherwise _next_stability",
         )
 
         match card.state:
@@ -276,32 +490,93 @@ class Scheduler:
 
                 # update the card's stability and difficulty
                 if card.stability is None or card.difficulty is None:
-                    card.stability = self._initial_stability(rating=rating)
-                    card.difficulty = self._initial_difficulty(
-                        rating=rating, clamp=True
+                    new_stability = self._initial_stability(rating=rating)
+                    _record(
+                        trace,
+                        source="_initial_stability",
+                        field="stability",
+                        before=card.stability,
+                        after=new_stability,
+                        note=f"first review of the card; lower-bounded at STABILITY_MIN={STABILITY_MIN}",
                     )
+                    card.stability = new_stability
+                    new_difficulty = self._initial_difficulty(rating=rating, clamp=True)
+                    _record(
+                        trace,
+                        source="_initial_difficulty",
+                        field="difficulty",
+                        before=card.difficulty,
+                        after=new_difficulty,
+                        note=f"clamped to [{MIN_DIFFICULTY}, {MAX_DIFFICULTY}]",
+                    )
+                    card.difficulty = new_difficulty
 
                 elif days_since_last_review is not None and days_since_last_review < 1:
-                    card.stability = self._short_term_stability(
+                    new_stability = self._short_term_stability(
                         stability=card.stability, rating=rating
                     )
-                    card.difficulty = self._next_difficulty(
+                    _record(
+                        trace,
+                        source="_short_term_stability",
+                        field="stability",
+                        before=card.stability,
+                        after=new_stability,
+                        note=f"same-day review (days_since_last_review < 1); lower-bounded at STABILITY_MIN={STABILITY_MIN}",
+                    )
+                    card.stability = new_stability
+                    new_difficulty = self._next_difficulty(
                         difficulty=card.difficulty, rating=rating
                     )
+                    _record(
+                        trace,
+                        source="_next_difficulty",
+                        field="difficulty",
+                        before=card.difficulty,
+                        after=new_difficulty,
+                        note=f"clamped to [{MIN_DIFFICULTY}, {MAX_DIFFICULTY}]",
+                    )
+                    card.difficulty = new_difficulty
 
                 else:
-                    card.stability = self._next_stability(
+                    retrievability = self.get_card_retrievability(
+                        card,
+                        current_datetime=review_datetime,
+                    )
+                    _record(
+                        trace,
+                        source="get_card_retrievability",
+                        field="retrievability",
+                        before=None,
+                        after=retrievability,
+                        note="elapsed_days = max(0, (review_datetime - last_review).days)",
+                    )
+                    new_stability = self._next_stability(
                         difficulty=card.difficulty,
                         stability=card.stability,
-                        retrievability=self.get_card_retrievability(
-                            card,
-                            current_datetime=review_datetime,
-                        ),
+                        retrievability=retrievability,
                         rating=rating,
                     )
-                    card.difficulty = self._next_difficulty(
+                    _record(
+                        trace,
+                        source="_next_stability",
+                        field="stability",
+                        before=card.stability,
+                        after=new_stability,
+                        note=f"lower-bounded at STABILITY_MIN={STABILITY_MIN}",
+                    )
+                    card.stability = new_stability
+                    new_difficulty = self._next_difficulty(
                         difficulty=card.difficulty, rating=rating
                     )
+                    _record(
+                        trace,
+                        source="_next_difficulty",
+                        field="difficulty",
+                        before=card.difficulty,
+                        after=new_difficulty,
+                        note=f"clamped to [{MIN_DIFFICULTY}, {MAX_DIFFICULTY}]",
+                    )
+                    card.difficulty = new_difficulty
 
                 # calculate the card's next interval
                 ## first if-clause handles edge case where the Card in the Learning state was previously
@@ -310,34 +585,89 @@ class Scheduler:
                     card.step >= len(self.learning_steps)
                     and rating in (Rating.Hard, Rating.Good, Rating.Easy)
                 ):
+                    _record(
+                        trace,
+                        source="update_state",
+                        field="state",
+                        before=card.state,
+                        after=State.Review,
+                        note="learning steps exhausted; card graduates to Review",
+                    )
                     card.state = State.Review
                     card.step = None
 
                     next_interval_days = self._next_interval(stability=card.stability)
                     next_interval = timedelta(days=next_interval_days)
+                    _record(
+                        trace,
+                        source="_next_interval",
+                        field="next_interval",
+                        before=None,
+                        after=next_interval,
+                        note="rounded to whole days; clamped to [1, maximum_interval]",
+                    )
 
                 else:
                     match rating:
                         case Rating.Again:
                             card.step = 0
                             next_interval = self.learning_steps[card.step]
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="step",
+                                before=None,
+                                after=card.step,
+                                note="Again resets to the first learning step",
+                            )
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="next_interval",
+                                before=None,
+                                after=next_interval,
+                                note="learning_steps[0]",
+                            )
 
                         case Rating.Hard:
                             # card step stays the same
 
                             if card.step == 0 and len(self.learning_steps) == 1:
                                 next_interval = self.learning_steps[0] * 1.5
+                                hard_note = "learning_steps[0] * 1.5"
                             elif card.step == 0 and len(self.learning_steps) >= 2:
                                 next_interval = (
                                     self.learning_steps[0] + self.learning_steps[1]
                                 ) / 2.0
+                                hard_note = (
+                                    "average of learning_steps[0] and learning_steps[1]"
+                                )
                             else:
                                 next_interval = self.learning_steps[card.step]
+                                hard_note = (
+                                    f"learning_steps[{card.step}]; step unchanged"
+                                )
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="next_interval",
+                                before=None,
+                                after=next_interval,
+                                note=hard_note,
+                            )
 
                         case Rating.Good:
                             if card.step + 1 == len(
                                 self.learning_steps
                             ):  # the last step
+                                _record(
+                                    trace,
+                                    source="update_state",
+                                    field="state",
+                                    before=card.state,
+                                    after=State.Review,
+                                    note="Good on the last learning step; card graduates to Review",
+                                )
                                 card.state = State.Review
                                 card.step = None
 
@@ -345,12 +675,44 @@ class Scheduler:
                                     stability=card.stability
                                 )
                                 next_interval = timedelta(days=next_interval_days)
+                                _record(
+                                    trace,
+                                    source="_next_interval",
+                                    field="next_interval",
+                                    before=None,
+                                    after=next_interval,
+                                    note="rounded to whole days; clamped to [1, maximum_interval]",
+                                )
 
                             else:
                                 card.step += 1
                                 next_interval = self.learning_steps[card.step]
+                                _record(
+                                    trace,
+                                    source="update_state",
+                                    field="step",
+                                    before=card.step - 1,
+                                    after=card.step,
+                                    note="Good advances one learning step",
+                                )
+                                _record(
+                                    trace,
+                                    source="update_state",
+                                    field="next_interval",
+                                    before=None,
+                                    after=next_interval,
+                                    note=f"learning_steps[{card.step}]",
+                                )
 
                         case Rating.Easy:
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="state",
+                                before=card.state,
+                                after=State.Review,
+                                note="Easy graduates the card to Review immediately",
+                            )
                             card.state = State.Review
                             card.step = None
 
@@ -358,6 +720,14 @@ class Scheduler:
                                 stability=card.stability
                             )
                             next_interval = timedelta(days=next_interval_days)
+                            _record(
+                                trace,
+                                source="_next_interval",
+                                field="next_interval",
+                                before=None,
+                                after=next_interval,
+                                note="rounded to whole days; clamped to [1, maximum_interval]",
+                            )
 
                         case _:
                             raise ValueError(f"Unknown rating: {rating}")
@@ -368,23 +738,59 @@ class Scheduler:
 
                 # update the card's stability and difficulty
                 if days_since_last_review is not None and days_since_last_review < 1:
-                    card.stability = self._short_term_stability(
+                    new_stability = self._short_term_stability(
                         stability=card.stability, rating=rating
                     )
+                    _record(
+                        trace,
+                        source="_short_term_stability",
+                        field="stability",
+                        before=card.stability,
+                        after=new_stability,
+                        note=f"same-day review (days_since_last_review < 1); lower-bounded at STABILITY_MIN={STABILITY_MIN}",
+                    )
+                    card.stability = new_stability
                 else:
-                    card.stability = self._next_stability(
+                    retrievability = self.get_card_retrievability(
+                        card,
+                        current_datetime=review_datetime,
+                    )
+                    _record(
+                        trace,
+                        source="get_card_retrievability",
+                        field="retrievability",
+                        before=None,
+                        after=retrievability,
+                        note="elapsed_days = max(0, (review_datetime - last_review).days)",
+                    )
+                    new_stability = self._next_stability(
                         difficulty=card.difficulty,
                         stability=card.stability,
-                        retrievability=self.get_card_retrievability(
-                            card,
-                            current_datetime=review_datetime,
-                        ),
+                        retrievability=retrievability,
                         rating=rating,
                     )
+                    _record(
+                        trace,
+                        source="_next_stability",
+                        field="stability",
+                        before=card.stability,
+                        after=new_stability,
+                        note=f"lower-bounded at STABILITY_MIN={STABILITY_MIN}",
+                    )
+                    card.stability = new_stability
 
-                card.difficulty = self._next_difficulty(
+                new_difficulty = self._next_difficulty(
                     difficulty=card.difficulty, rating=rating
                 )
+                _record(
+                    trace,
+                    source="_next_difficulty",
+                    field="difficulty",
+                    before=card.difficulty,
+                    after=new_difficulty,
+                    note=f"clamped to [{MIN_DIFFICULTY}, {MAX_DIFFICULTY}]",
+                )
+                card.difficulty = new_difficulty
 
                 # calculate the card's next interval
                 match rating:
@@ -395,18 +801,50 @@ class Scheduler:
                                 stability=card.stability
                             )
                             next_interval = timedelta(days=next_interval_days)
+                            _record(
+                                trace,
+                                source="_next_interval",
+                                field="next_interval",
+                                before=None,
+                                after=next_interval,
+                                note="no relearning steps configured; rounded to whole days, clamped to [1, maximum_interval]",
+                            )
 
                         else:
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="state",
+                                before=card.state,
+                                after=State.Relearning,
+                                note="Again lapses the card into Relearning at step 0",
+                            )
                             card.state = State.Relearning
                             card.step = 0
 
                             next_interval = self.relearning_steps[card.step]
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="next_interval",
+                                before=None,
+                                after=next_interval,
+                                note="relearning_steps[0]",
+                            )
 
                     case Rating.Hard | Rating.Good | Rating.Easy:
                         next_interval_days = self._next_interval(
                             stability=card.stability
                         )
                         next_interval = timedelta(days=next_interval_days)
+                        _record(
+                            trace,
+                            source="_next_interval",
+                            field="next_interval",
+                            before=None,
+                            after=next_interval,
+                            note="rounded to whole days; clamped to [1, maximum_interval]",
+                        )
 
                     case _:
                         raise ValueError(f"Unknown rating: {rating}")
@@ -418,26 +856,71 @@ class Scheduler:
 
                 # update the card's stability and difficulty
                 if days_since_last_review is not None and days_since_last_review < 1:
-                    card.stability = self._short_term_stability(
+                    new_stability = self._short_term_stability(
                         stability=card.stability, rating=rating
                     )
-                    card.difficulty = self._next_difficulty(
+                    _record(
+                        trace,
+                        source="_short_term_stability",
+                        field="stability",
+                        before=card.stability,
+                        after=new_stability,
+                        note=f"same-day review (days_since_last_review < 1); lower-bounded at STABILITY_MIN={STABILITY_MIN}",
+                    )
+                    card.stability = new_stability
+                    new_difficulty = self._next_difficulty(
                         difficulty=card.difficulty, rating=rating
                     )
+                    _record(
+                        trace,
+                        source="_next_difficulty",
+                        field="difficulty",
+                        before=card.difficulty,
+                        after=new_difficulty,
+                        note=f"clamped to [{MIN_DIFFICULTY}, {MAX_DIFFICULTY}]",
+                    )
+                    card.difficulty = new_difficulty
 
                 else:
-                    card.stability = self._next_stability(
+                    retrievability = self.get_card_retrievability(
+                        card,
+                        current_datetime=review_datetime,
+                    )
+                    _record(
+                        trace,
+                        source="get_card_retrievability",
+                        field="retrievability",
+                        before=None,
+                        after=retrievability,
+                        note="elapsed_days = max(0, (review_datetime - last_review).days)",
+                    )
+                    new_stability = self._next_stability(
                         difficulty=card.difficulty,
                         stability=card.stability,
-                        retrievability=self.get_card_retrievability(
-                            card,
-                            current_datetime=review_datetime,
-                        ),
+                        retrievability=retrievability,
                         rating=rating,
                     )
-                    card.difficulty = self._next_difficulty(
+                    _record(
+                        trace,
+                        source="_next_stability",
+                        field="stability",
+                        before=card.stability,
+                        after=new_stability,
+                        note=f"lower-bounded at STABILITY_MIN={STABILITY_MIN}",
+                    )
+                    card.stability = new_stability
+                    new_difficulty = self._next_difficulty(
                         difficulty=card.difficulty, rating=rating
                     )
+                    _record(
+                        trace,
+                        source="_next_difficulty",
+                        field="difficulty",
+                        before=card.difficulty,
+                        after=new_difficulty,
+                        note=f"clamped to [{MIN_DIFFICULTY}, {MAX_DIFFICULTY}]",
+                    )
+                    card.difficulty = new_difficulty
 
                 # calculate the card's next interval
                 ## first if-clause handles edge case where the Card in the Relearning state was previously
@@ -446,34 +929,87 @@ class Scheduler:
                     card.step >= len(self.relearning_steps)
                     and rating in (Rating.Hard, Rating.Good, Rating.Easy)
                 ):
+                    _record(
+                        trace,
+                        source="update_state",
+                        field="state",
+                        before=card.state,
+                        after=State.Review,
+                        note="relearning steps exhausted; card graduates to Review",
+                    )
                     card.state = State.Review
                     card.step = None
 
                     next_interval_days = self._next_interval(stability=card.stability)
                     next_interval = timedelta(days=next_interval_days)
+                    _record(
+                        trace,
+                        source="_next_interval",
+                        field="next_interval",
+                        before=None,
+                        after=next_interval,
+                        note="rounded to whole days; clamped to [1, maximum_interval]",
+                    )
 
                 else:
                     match rating:
                         case Rating.Again:
                             card.step = 0
                             next_interval = self.relearning_steps[card.step]
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="step",
+                                before=None,
+                                after=card.step,
+                                note="Again resets to the first relearning step",
+                            )
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="next_interval",
+                                before=None,
+                                after=next_interval,
+                                note="relearning_steps[0]",
+                            )
 
                         case Rating.Hard:
                             # card step stays the same
 
                             if card.step == 0 and len(self.relearning_steps) == 1:
                                 next_interval = self.relearning_steps[0] * 1.5
+                                hard_note = "relearning_steps[0] * 1.5"
                             elif card.step == 0 and len(self.relearning_steps) >= 2:
                                 next_interval = (
                                     self.relearning_steps[0] + self.relearning_steps[1]
                                 ) / 2.0
+                                hard_note = "average of relearning_steps[0] and relearning_steps[1]"
                             else:
                                 next_interval = self.relearning_steps[card.step]
+                                hard_note = (
+                                    f"relearning_steps[{card.step}]; step unchanged"
+                                )
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="next_interval",
+                                before=None,
+                                after=next_interval,
+                                note=hard_note,
+                            )
 
                         case Rating.Good:
                             if card.step + 1 == len(
                                 self.relearning_steps
                             ):  # the last step
+                                _record(
+                                    trace,
+                                    source="update_state",
+                                    field="state",
+                                    before=card.state,
+                                    after=State.Review,
+                                    note="Good on the last relearning step; card graduates to Review",
+                                )
                                 card.state = State.Review
                                 card.step = None
 
@@ -481,12 +1017,44 @@ class Scheduler:
                                     stability=card.stability
                                 )
                                 next_interval = timedelta(days=next_interval_days)
+                                _record(
+                                    trace,
+                                    source="_next_interval",
+                                    field="next_interval",
+                                    before=None,
+                                    after=next_interval,
+                                    note="rounded to whole days; clamped to [1, maximum_interval]",
+                                )
 
                             else:
                                 card.step += 1
                                 next_interval = self.relearning_steps[card.step]
+                                _record(
+                                    trace,
+                                    source="update_state",
+                                    field="step",
+                                    before=card.step - 1,
+                                    after=card.step,
+                                    note="Good advances one relearning step",
+                                )
+                                _record(
+                                    trace,
+                                    source="update_state",
+                                    field="next_interval",
+                                    before=None,
+                                    after=next_interval,
+                                    note=f"relearning_steps[{card.step}]",
+                                )
 
                         case Rating.Easy:
+                            _record(
+                                trace,
+                                source="update_state",
+                                field="state",
+                                before=card.state,
+                                after=State.Review,
+                                note="Easy graduates the card to Review immediately",
+                            )
                             card.state = State.Review
                             card.step = None
 
@@ -494,6 +1062,14 @@ class Scheduler:
                                 stability=card.stability
                             )
                             next_interval = timedelta(days=next_interval_days)
+                            _record(
+                                trace,
+                                source="_next_interval",
+                                field="next_interval",
+                                before=None,
+                                after=next_interval,
+                                note="rounded to whole days; clamped to [1, maximum_interval]",
+                            )
 
                         case _:
                             raise ValueError(f"Unknown rating: {rating}")
@@ -501,20 +1077,89 @@ class Scheduler:
             case _:
                 raise ValueError(f"Unknown card state: {card.state}")
 
-        if self.enable_fuzzing and card.state == State.Review:
-            next_interval = self._get_fuzzed_interval(interval=next_interval)
+        return next_interval
 
-        card.due = review_datetime + next_interval
-        card.last_review = review_datetime
+    def next_states(
+        self,
+        card: Card,
+        review_datetime: datetime | None = None,
+        trace: Trace | None = None,
+    ) -> NextStates:
+        """
+        Computes, in one call, the next Card for each of the four ratings.
 
-        review_log = ReviewLog(
-            card_id=card.card_id,
-            rating=rating,
-            review_datetime=review_datetime,
-            review_duration=review_duration,
+        Args:
+            card: The card to preview. It is never mutated in place.
+            review_datetime: The date and time of the hypothetical review.
+            trace: An optional Trace that collects a TraceRecord per step and rating.
+
+        Returns:
+            NextStates: The four possible next Cards (Again/Hard/Good/Easy).
+
+        Raises:
+            ValueError: If the `review_datetime` argument is not timezone-aware and set to UTC.
+
+        Design note (shared vs. recomputed memory state): each rating is recomputed
+        from a fresh copy of the input card instead of reusing one shared,
+        already-updated memory state. Reusing a single copy would be cheaper, but
+        update_state() mutates its card in place, so the four ratings would
+        contaminate each other (and the caller's card). The 4x recompute cost buys
+        guaranteed isolation between the ratings. Fuzzing is skipped so the preview
+        is deterministic.
+        """
+
+        self._validate_review_datetime(review_datetime=review_datetime)
+
+        if review_datetime is None:
+            review_datetime = datetime.now(timezone.utc)
+
+        next_cards: dict[Rating, Card] = {}
+        previous_context = trace.context if trace is not None else ""
+        try:
+            for rating in Rating:
+                # fresh copy per rating: update_state() mutates in place, so a shared
+                # copy would let earlier ratings pollute later ones
+                rating_card = copy(card)
+
+                if trace is not None:
+                    trace.context = f"next_states:{rating.name}"
+
+                next_interval = self.update_state(
+                    card=rating_card,
+                    rating=rating,
+                    review_datetime=review_datetime,
+                    trace=trace,
+                )
+
+                rating_card.due = review_datetime + next_interval
+                rating_card.last_review = review_datetime
+                _record(
+                    trace,
+                    source="next_states",
+                    field="due",
+                    before=None,
+                    after=rating_card.due,
+                    note="preview only: no fuzzing applied, no ReviewLog created",
+                )
+
+                next_cards[rating] = rating_card
+        finally:
+            if trace is not None:
+                trace.context = previous_context
+
+        return NextStates(
+            again=next_cards[Rating.Again],
+            hard=next_cards[Rating.Hard],
+            good=next_cards[Rating.Good],
+            easy=next_cards[Rating.Easy],
         )
 
-        return card, review_log
+    @staticmethod
+    def _validate_review_datetime(review_datetime: datetime | None) -> None:
+        if review_datetime is not None and (
+            (review_datetime.tzinfo is None) or (review_datetime.tzinfo != timezone.utc)
+        ):
+            raise ValueError("datetime must be timezone-aware and set to UTC")
 
     def reschedule_card(self, card: Card, review_logs: list[ReviewLog]) -> Card:
         """
@@ -855,4 +1500,4 @@ class Scheduler:
         return fuzzed_interval
 
 
-__all__ = ["Scheduler"]
+__all__ = ["NextStates", "Scheduler", "Trace", "TraceRecord"]

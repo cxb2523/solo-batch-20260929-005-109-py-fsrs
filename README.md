@@ -32,6 +32,7 @@
 - [Quickstart](#quickstart)
 - [Usage](#usage)
 - [Optimizer (optional)](#optimizer-optional)
+- [Tracing and next_states (observability)](#tracing-and-next_states-observability)
 - [Reference](#reference)
 - [API Documentation](#api-documentation)
 - [Interactive Demo](#interactive-demo)
@@ -229,6 +230,56 @@ After creating a new scheduler with optimized parameters, you may want to resche
 # repeat the following for each of your cards
 rescheduled_card = optimal_scheduler.reschedule_card(card, review_logs_for_that_card)
 ```
+
+## Tracing and next_states (observability)
+
+`Scheduler.review_card` and `Scheduler.next_states` share one state machine,
+`Scheduler.update_state`, and both accept an optional `Trace` that records every
+step from Rating to Card/ReviewLog as a `TraceRecord` (field, source function,
+before/after value, note). Run `python tools/trace_report.py` to generate
+`trace_report.html`, which lists, per rating, each state field value and the
+function that produced it.
+
+```python
+from fsrs import Card, Rating, Scheduler
+from fsrs.scheduler import Trace
+
+scheduler = Scheduler(enable_fuzzing=False)
+trace = Trace()
+
+card = Card()
+card, review_log = scheduler.review_card(card, Rating.Good, trace=trace)
+for record in trace.records:
+    print(record.source, record.field, record.before, "->", record.after)
+
+# preview the next Card for all four ratings at once
+next_states = scheduler.next_states(card, trace=trace)
+print(next_states.again.due, next_states.easy.due)
+```
+
+Two design decisions, and why they were made:
+
+1. **next_states recomputes each rating from a fresh copy of the input card
+   instead of reusing one shared, already-computed memory state.** Reuse would
+   save three copies and their computation, but `update_state` mutates its card
+   in place, so the four ratings would contaminate each other (and the caller's
+   card). The 4x recompute cost buys guaranteed isolation: the Again/Hard/Good/
+   Easy previews are independent, and the input card is never mutated. Fuzzing
+   is skipped in `next_states` so the preview is deterministic.
+
+2. **review_card keeps ReviewLog at exactly four public fields** (`card_id`,
+   `rating`, `review_datetime`, `review_duration`) — precisely what the
+   Optimizer consumes. All intermediate scheduling values (retrievability,
+   stability/difficulty updates and their clamp bounds, step/state transitions,
+   interval choice) are exposed only through the opt-in `Trace`, so the
+   scheduling API is not inflated with internal structure.
+
+Boundary behavior worth knowing when reading a trace: `days_since_last_review`
+uses `timedelta.days` (floored to whole days); values `< 1` select
+`_short_term_stability`, otherwise `_next_stability` with
+`elapsed_days = max(0, ...)`. Stability is lower-bounded at `STABILITY_MIN`
+and difficulty is clamped to `[1.0, 10.0]` in the Learning, Review, and
+Relearning branches alike.
 
 ## Reference
 
